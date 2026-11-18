@@ -107,8 +107,9 @@ flowchart TB
 
 ## 검증과 한계
 
-- 저장소마다 자기 소스만 빌드하는 CI가 있습니다. 알림 라우팅을 배포할 때 platform·backend·web·system CI가 공개
-  Ubuntu runner에서 통과했고, backend·web 이미지가 GHCR에 게시됐습니다.
+- 저장소마다 자기 소스만 빌드하는 CI가 있습니다. 공개 직후 11개 저장소의 원격 CI가 모두 통과했고, 빈 폴더에서
+  고정 commit으로 checkout → 공개 패키지 해시 확인 → locked restore → 검증 도구 빌드까지 재현했습니다.
+- 그 뒤 알림 라우팅을 배포할 때 platform·backend·web·system CI가 다시 통과했고, backend·web 이미지가 GHCR에 게시됐습니다.
 - 운영 서버가 없어서 자동 운영 배포까지 했다고는 말하지 않습니다.
 - 통합 검증 도구는 백엔드·설비 커넥터 내부 로직을 보려고 **TestSupport 패키지**를 씁니다. 저장소 간 소스 결합은
   없앴지만, 내부 타입에 기대는 화이트박스 검증 결합까지 없앤 것은 아닙니다.
