@@ -1,0 +1,27 @@
+# 왼쪽 메뉴 순서. file은 저장소 안 Markdown 파일 이름이다.
+- title: 홈
+  file: index
+- title: 설계 과정
+  file: design
+- title: 서비스 아키텍처와 요청 흐름
+  file: architecture
+- title: 작업지시·생산실적
+  file: orders
+- title: 설비 연결·수집
+  file: collection
+- title: 경보
+  file: alarms
+- title: AI 분석
+  file: analysis
+- title: 알림·발송
+  file: notifications
+- title: 생산 통계·대시보드
+  file: reporting
+- title: 기준정보·계정
+  file: master-data
+- title: 레포 분리 리팩터링
+  file: refactoring
+- title: AI 협업 운영 방식
+  file: ai-collaboration
+- title: 한계와 다음 단계
+  file: limits

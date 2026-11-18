@@ -1,0 +1,240 @@
+/* FactoryMES 포트폴리오 사이트 공통 모양 */
+:root {
+  --ink: #1f2933;
+  --muted: #5b6b7c;
+  --line: #d6dee8;
+  --surface: #ffffff;
+  --page: #f5f7fa;
+  --accent: #0b6e79;
+  --accent-tint: #e4f2f3;
+  --note: #fff6e5;
+  --note-line: #d99a1e;
+  --radius: 8px;
+  --font: "Pretendard", "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans KR", system-ui,
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font);
+  line-height: 1.75;
+}
+
+a {
+  color: var(--accent);
+}
+
+.site-header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 14px 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.site-title {
+  font-weight: 800;
+  font-size: 1.2rem;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.site-tagline {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.menu-toggle {
+  display: none;
+  margin-left: auto;
+}
+
+.site-body {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.site-nav {
+  padding: 24px 16px;
+  border-right: 1px solid var(--line);
+  min-height: calc(100vh - 56px);
+}
+
+.site-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.site-nav li a {
+  display: block;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 0.95rem;
+}
+
+.site-nav li a[aria-current="page"] {
+  background: var(--accent-tint);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.nav-repos {
+  margin-top: 24px;
+  font-size: 0.85rem;
+}
+
+.content {
+  padding: 32px 40px 64px;
+  min-width: 0;
+  max-width: 980px;
+}
+
+.content h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+
+.content h2 {
+  margin-top: 48px;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--line);
+}
+
+.content h3 {
+  margin-top: 32px;
+}
+
+.content img {
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 16px 0;
+  background: var(--surface);
+  font-size: 0.95rem;
+}
+
+.content th,
+.content td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.content th {
+  background: var(--accent-tint);
+}
+
+.content blockquote {
+  margin: 16px 0;
+  padding: 10px 16px;
+  border-left: 4px solid var(--note-line);
+  background: var(--note);
+}
+
+.content code {
+  font-size: 0.9em;
+  background: #eef2f6;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.content pre {
+  overflow-x: auto;
+  background: #0f1720;
+  color: #e5edf5;
+  padding: 14px;
+  border-radius: var(--radius);
+}
+
+.content pre code {
+  background: none;
+  padding: 0;
+}
+
+/* 구성도·흐름도 */
+.mermaid {
+  margin: 16px 0;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+
+/* 화면 하나: 스크린샷 → 이유 → 소스 보기 */
+.screen {
+  margin: 24px 0 40px;
+}
+
+.source-link {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 4px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+
+.source-link::before {
+  content: "</> ";
+}
+
+.site-footer {
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+  border-top: 1px solid var(--line);
+}
+
+@media (max-width: 800px) {
+  .menu-toggle {
+    display: inline-block;
+  }
+
+  .site-tagline {
+    display: none;
+  }
+
+  .site-body {
+    grid-template-columns: 1fr;
+  }
+
+  .site-nav {
+    display: none;
+    min-height: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .site-nav.open {
+    display: block;
+  }
+
+  .content {
+    padding: 24px 16px 48px;
+  }
+}

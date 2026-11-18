@@ -1,0 +1,24 @@
+# FactoryMES 포트폴리오 사이트(GitHub Pages, 기본 Jekyll)
+title: FactoryMES
+description: C#·MSA로 만든 미니 MES와 설비 모니터링 포트폴리오
+baseurl: /doc
+url: https://nkpfactorymes.github.io
+lang: ko
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter_opts:
+    disable: true
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: false
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+exclude:
+  - README.source.md
+  - tools/
