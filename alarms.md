@@ -4,11 +4,22 @@ title: 경보
 
 # 경보
 
-두 가지 경보를 다룹니다. **통신 끊김(COMM_LOST)**은 유효한 데이터가 정해진 시간 넘게 들어오지 않을 때,
-**상한 초과(HIGH)**는 온도 같은 측정값이 위험 범위에 머물 때 열립니다. 열린 경보는 확인(ACK) →
-조치 → 종결 순서로 사람이 처리합니다.
+## 개요
 
-## 구성도
+설비 경보는 두 종류입니다. 통신 끊김(COMM_LOST)은 유효한 측정이 정해진 시간 이상 들어오지 않을 때,
+상한 초과(HIGH)는 온도 같은 측정값이 위험 범위에 머물 때 발생합니다. 발생한 경보는 확인(ACK), 조치,
+종결을 각각 별도의 기록으로 관리하며, 경보 발생과 함께 알림함 알림과 Outbox 이벤트를 생성합니다.
+
+```text
+측정 저장 → HIGH 판정 ┐
+Quartz 5초 감시 → COMM_LOST 판정 · HIGH 보조 재평가 ┘
+  → ALARM(ACTIVE) + 알림함 + Outbox
+  → 확인(ACK) → 조치(OPEN → IN_PROGRESS → DONE)
+  → 복구(RECOVERED) → 관리자 정상 종결
+  → 또는 관리자 강제 종결 + 30분 억제
+```
+
+## 구성
 
 ```mermaid
 flowchart LR
@@ -23,38 +34,57 @@ flowchart LR
     ui --> action[("ALARM_ACTION")]
 ```
 
-## 상태 흐름
+## 상태 전이
 
 ```mermaid
 stateDiagram-v2
     [*] --> ACTIVE: 발생
-    ACTIVE --> RECOVERED: 측정이 정상으로 돌아옴
+    ACTIVE --> RECOVERED: 측정값 정상 복귀
     RECOVERED --> CLOSED: 정상 종결<br/>ACK + 완료 조치 1건 이상 + 사유
     ACTIVE --> CLOSED: 강제 종결<br/>미완료 조치 0 + 사유 + 30분 억제
     CLOSED --> [*]
 ```
 
-경보 상태와 별개로 **ACK(본 사람·시각)**와 **조치(OPEN → IN_PROGRESS → DONE)**가 따로 쌓입니다.
+| 동작 | 조건 | 권한 |
+|---|---|---|
+| 조치 등록 | ACTIVE·RECOVERED, 내용 필수 | 관리자: 담당자 지정 / 작업자: 본인 |
+| 조치 시작·완료 | OPEN → IN_PROGRESS → DONE 순서만 허용 | 관리자 또는 조치 담당 작업자 |
+| 정상 종결 | RECOVERED, ACK 있음, 완료 조치 1건 이상, 미완료 0 | 관리자 |
+| 강제 종결 | ACTIVE, 미완료 조치 0, 사유 필수 | 관리자 |
 
 ## 설계
 
-### 문제
-- 데이터가 아예 안 오면 "수신할 때 판정"하는 방식으로는 끊김을 알 수 없습니다.
-- 값이 경계 근처에서 흔들리면 경보가 열렸다 닫혔다를 반복합니다.
-- 센서 값이 돌아왔다고 해서 사람이 필요한 조치를 끝낸 것은 아닙니다.
+### 통신 끊김 감지
 
-### 검토한 안과 선택
+데이터가 아예 들어오지 않는 상황은 수신 시점에 판정하는 방식으로는 발견할 수 없습니다. Quartz가 5초마다
+백엔드 내부 API를 호출해 마지막 유효 측정의 측정 시각과 수신 시각을 모두 확인합니다. 감시 로직을 Jobs가 아닌
+백엔드에 둔 것은 경보 규칙과 트랜잭션을 한곳에서 관리하기 위해서입니다. 최대 한 주기만큼 감지가 늦어질 수
+있습니다.
 
-| 고민 | 비교한 안 | 선택과 이유 |
+### 상한 경보와 히스테리시스
+
+임계값 하나로 발생과 복구를 함께 판정하면 값이 경계 근처에서 흔들릴 때 경보가 반복해서 열리고 닫힙니다.
+발생 임계값과 복구 임계값, 각각의 유지 시간을 따로 두었습니다.
+
+```text
+발생: 값 ≥ 26.0℃ 상태가 2초 연속 → ACTIVE
+복구: 값 ≤ 25.8℃ 상태가 2초 연속 → RECOVERED
+그 사이 값: 현재 상태 유지
+```
+
+| 항목 | 검토한 방식 | 결정 |
 |---|---|---|
-| 끊김 감지 | 수신 시 판정 / **주기 감시** | 시간이 지나는 것 자체가 조건이라 Quartz가 5초마다 백엔드 내부 API를 부릅니다. 최대 한 주기만큼 늦게 감지합니다. |
-| 감시 위치 | Jobs가 SQL 직접 / **백엔드 내부 API** | 규칙과 트랜잭션을 한 곳에 둡니다. Jobs를 다른 서버로 옮겨도 규칙이 갈라지지 않습니다. |
-| HIGH 기준 | 임계값 하나 / **발생·복구 임계값 둘 + 유지 시간** | 예: 26.0℃ 이상 2초 → 발생, 25.8℃ 이하 2초 → 복구. 그 사이에서는 상태를 유지해 반복 전환을 줄입니다. |
-| HIGH 판정 시점 | 5초 배치만 / **수집 저장 직후 + 배치 보조** | 배치 사이에 끝난 짧은 초과도 놓치지 않습니다. 대신 수집 트랜잭션에 판정 비용이 들어갑니다. |
-| 연속 구간 기억 | 메모리 타이머 / **Oracle 측정 이력** | 재시작해도 근거가 남습니다. |
-| 복구 처리 | 복구되면 자동 종결 / **ACK·조치·관리자 검토 후 종결** | 신호 복귀와 업무 완료를 분리합니다. |
-| 강제 종결 | 복구로 처리 / **FORCED 이력 + 30분 억제** | 고장 신호가 남은 예외를 복구로 꾸미지 않고, 바로 반복되는 경보 폭주를 막습니다. |
-| 알림 읽음과 ACK | 같은 것 / **별개** | 개인이 알림을 읽은 것과 업무상 경보를 확인한 것은 의미와 주인이 다릅니다. |
+| 연속 구간 판단 | 메모리 타이머 / Oracle 측정 이력 | 측정 이력에서 복원. 재시작 후에도 근거 유지 |
+| 판정 시점 | 5초 배치만 / 수집 저장 직후 + 배치 보조 | 배치 사이에 끝난 짧은 초과도 감지. 수집 트랜잭션에 판정 비용 추가 |
+| 불량 측정 | 제외하고 판정 / 연속 구간에 포함 | 불량 측정을 건너뛰어 정상 연속으로 오인하지 않음 |
+| 경보 중 임계값 변경 | 허용 / ACTIVE 경보가 없을 때만 | 이미 발생한 경보의 의미가 새 기준으로 바뀌지 않음 |
+
+### 확인·조치·종결의 분리
+
+센서 값이 정상으로 돌아왔다고 해서 현장 조치가 끝난 것은 아닙니다. 복구 시 자동 종결하지 않고,
+확인(ACK)·조치 완료·관리자 검토를 거쳐 종결하도록 했습니다. 고장 신호가 남은 상태를 복구로 처리하지 않도록
+강제 종결은 FORCED 이력으로 남기고, 같은 규칙의 경보가 곧바로 다시 쏟아지지 않도록 30분간 억제합니다.
+개인의 알림 읽음과 업무상 경보 확인도 의미와 주체가 달라 별도 상태로 관리합니다.
 
 ## 화면
 
@@ -64,9 +94,8 @@ stateDiagram-v2
 
 ![경보 목록](assets/screens/alarms-admin.png)
 
-행 왼쪽 색 띠와 상태 배지로 **아직 열린 경보(ACTIVE)**가 먼저 눈에 띄게 했습니다. 종류·등급·발생 시각과
-함께 **확인 여부**를 따로 보여줘서 "복구됐지만 아무도 확인하지 않은 경보"를 찾을 수 있습니다.
-작업자는 본인 담당 설비의 경보만 봅니다.
+행 왼쪽 색 띠와 상태 배지로 발생 중인 경보가 먼저 보이도록 하고, 확인 여부를 별도 열로 표시해 복구됐지만
+아무도 확인하지 않은 경보를 찾을 수 있게 했습니다. 작업자는 담당 설비의 경보만 조회합니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-web/blob/2d05837500b6de42f46230227fc593291856e0ff/services/web-client/Pages/Alarms.razor#L60-L163">소스 보기</a>
 
@@ -78,9 +107,9 @@ stateDiagram-v2
 
 ![경보 상세와 조치 등록](assets/screens/alarms-detail.png)
 
-상세에는 발생·복구·확인·종결 시각을 따로 적고, **"ACK는 인지 기록일 뿐 복구·종결이 아니다"**,
-**"조치를 완료해도 종결되지 않는다"**는 안내를 화면에 직접 넣었습니다. 사용자가 버튼 하나의 의미를
-오해하지 않게 하려는 것입니다. 조치는 등록 → 시작 → 완료 순서로만 바뀌고, 등록한 조치는 취소할 수 없습니다.
+발생·복구·확인·종결 시각을 따로 표시하고, ACK는 인지 기록일 뿐 복구나 종결이 아니며 조치를 완료해도
+종결되지 않는다는 안내를 화면에 넣었습니다. 조치는 등록 → 시작 → 완료 순서로만 변경되고, 등록된 조치는
+취소할 수 없습니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-web/blob/2d05837500b6de42f46230227fc593291856e0ff/services/web-client/Components/AlarmActions.razor#L1-L172">소스 보기</a>
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/services/mes-backend/Features/Alarms/AlarmService.Actions.cs#L86-L264">조치 API</a>
@@ -93,19 +122,18 @@ stateDiagram-v2
 
 ![경보 규칙 설정](assets/screens/alarm-rules.png)
 
-규칙 화면 맨 위에 COMM_LOST와 HIGH의 판정 조건을 문장으로 적었습니다. 목록의 **억제** 열은 강제 종결 후
-30분 동안 새 경보를 막고 있는 규칙을 보여줍니다. 경보가 열려 있는 동안에는 임계값을 바꿀 수 없게 해서,
-이미 발생한 사건의 의미가 새 기준으로 바뀌지 않게 했습니다.
+COMM_LOST와 HIGH의 판정 조건을 화면 상단에 설명하고, 억제 열에는 강제 종결 후 새 경보를 막고 있는 기간을
+표시합니다. 경보가 발생 중인 동안에는 임계값을 변경할 수 없습니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-web/blob/2d05837500b6de42f46230227fc593291856e0ff/services/web-client/Pages/Alarms.razor#L213-L432">소스 보기</a>
 
 </div>
 
-## 핵심 코드
+## 주요 코드
 
 <div class="screen" markdown="1">
 
-COMM_LOST 감시: 마지막 유효 측정의 측정·수신 시각을 모두 보고, 억제 중이면 새 경보를 만들지 않습니다.
+COMM_LOST 감시: 마지막 유효 측정의 측정·수신 시각 확인, 억제 기간 중 신규 경보 생성 차단.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/services/mes-backend/Features/Alarms/AlarmService.Watch.cs#L79-L184">소스 보기</a>
 
@@ -113,7 +141,7 @@ COMM_LOST 감시: 마지막 유효 측정의 측정·수신 시각을 모두 보
 
 <div class="screen" markdown="1">
 
-HIGH 판정: 측정 이력에서 발생·복구 연속 구간을 복원합니다. 불량(BAD) 측정도 구간에 포함해 건너뛰지 않습니다.
+HIGH 판정: 측정 이력에서 발생·복구 연속 구간 복원, 불량 측정 포함.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/services/mes-backend/Features/Alarms/AlarmService.High.cs#L48-L184">소스 보기</a>
 
@@ -121,7 +149,7 @@ HIGH 판정: 측정 이력에서 발생·복구 연속 구간을 복원합니다
 
 <div class="screen" markdown="1">
 
-정상·강제 종결: 조건을 서버 트랜잭션 안에서 다시 검사합니다.
+정상·강제 종결: 종결 조건을 서버 트랜잭션 안에서 재검사.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/services/mes-backend/Features/Alarms/AlarmService.Actions.cs#L291-L378">소스 보기</a>
 
@@ -129,11 +157,10 @@ HIGH 판정: 측정 이력에서 발생·복구 연속 구간을 복원합니다
 
 ## 검증과 한계
 
-- 시뮬레이터를 멈춰 COMM_LOST 발생·복구, 온도를 올려 HIGH 발생·복구, ACK·조치·정상/강제 종결,
-  강제 종결 뒤 억제 기간에 새 경보가 열리지 않는 것을 API와 브라우저로 확인했습니다.
-  억제가 끝난 뒤 다시 열리는 장면은 따로 시연하지 않았습니다.
-- 상세: [COMM_LOST·알림함](https://github.com/nkpFactoryMES/factorymes-system/blob/de9e542d9e362add9f5aec3293986d4744c13b12/docs/comm-lost-alarms-inbox.md),
+- 시뮬레이터 중지에 따른 COMM_LOST 발생·복구, 온도 상승에 따른 HIGH 발생·복구 확인
+- ACK·조치·정상 종결·강제 종결과 억제 기간 중 신규 경보 미생성 확인(API·브라우저)
+- 상세 문서: [COMM_LOST·알림함](https://github.com/nkpFactoryMES/factorymes-system/blob/de9e542d9e362add9f5aec3293986d4744c13b12/docs/comm-lost-alarms-inbox.md),
   [HIGH 임계치](https://github.com/nkpFactoryMES/factorymes-system/blob/de9e542d9e362add9f5aec3293986d4744c13b12/docs/high-alarms-design.md),
   [조치·종결](https://github.com/nkpFactoryMES/factorymes-system/blob/de9e542d9e362add9f5aec3293986d4744c13b12/docs/alarm-actions-closure.md)
-- 경보는 알림과 조치에만 씁니다. 작업을 자동으로 멈추거나 설비를 제어하지 않습니다.
-- LOW·변화율·이상 탐지 경보와 조치 취소·재배정은 범위 밖입니다.
+- 억제 만료 후 재발생은 별도 시연 미진행
+- 작업 자동 중지·설비 제어, LOW·변화율·이상 탐지 경보, 조치 취소·재배정은 범위 밖

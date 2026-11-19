@@ -4,10 +4,21 @@ title: 레포 분리 리팩터링
 
 # 레포 분리 리팩터링
 
-기능을 다 만든 뒤, 회사처럼 **바뀐 서비스만 빌드·배포**되게 하자는 제 결정으로 하나의 저장소를 **서비스별 공개 저장소 11개**로 나눴습니다.
-런타임 구조(서비스·HTTP·토큰 경계)는 이미 나뉘어 있었고, 문제는 **빌드 경계**였습니다.
+## 개요
 
-## Before / After
+하나의 저장소로 개발하던 FactoryMES를 서비스별 공개 저장소 11개로 분리했습니다. 서비스 프로세스와 HTTP·토큰
+경계는 이미 나뉘어 있었지만, 빌드 경계가 하나로 묶여 있어 한 서비스만 수정해도 전체 이미지의 빌드 입력이
+함께 바뀌는 문제가 있었습니다. 서비스 동작과 데이터 소유는 그대로 두고 저장소·패키지·이미지의 빌드 입력만
+분리해, 변경된 서비스만 빌드·배포할 수 있는 구조로 바꿨습니다.
+
+```text
+Before: 저장소 1개 → Dockerfile 1개(COPY . . → 솔루션 전체 restore) → 이미지 10개
+After : platform → GitHub Release 패키지(SHA-256 고정)
+          → 서비스 저장소 9개(각자 Dockerfile·CI·GHCR)
+          → system 저장소(DDL·Compose·통합 검증, 검증된 commit으로 checkout)
+```
+
+## 구성
 
 ```mermaid
 flowchart TB
@@ -16,7 +27,7 @@ flowchart TB
         mono["FactoryMES/<br/>shared · services · simulators · tests · tools"]
         df["Dockerfile 1개<br/>COPY . . → 솔루션 전체 restore"]
         mono --> df
-        df --> img1["이미지 10개<br/>소스 한 줄만 바뀌어도 모두 영향"]
+        df --> img1["이미지 10개<br/>소스 변경 시 모두 영향"]
     end
 
     subgraph after["After: 저장소 11개"]
@@ -26,56 +37,74 @@ flowchart TB
         svc["서비스 저장소 9개<br/>각자 Dockerfile · CI · GHCR"]
         sys["factorymes-system<br/>DDL · Compose · 통합 검증"]
         platform --> rel
-        rel -->|"정확한 버전 [1.1.0]<br/>+ 해시 확인"| svc
+        rel -->|"정확한 버전<br/>+ 해시 확인"| svc
         rel --> sys
-        sys -->|"검토된 commit으로 checkout"| svc
+        sys -->|"검증된 commit으로 checkout"| svc
     end
 ```
 
 | 항목 | Before | After |
 |---|---:|---:|
 | 저장소 | 1 | 11 |
-| Dockerfile | 1 | 10(서비스별) |
-| 다른 저장소 소스를 참조하는 ProjectReference | 해당 경계 없음 | 0 |
-| 저장소 밖 소스를 끌어오는 Compile | 측정 안 함 | 0 |
-| 공유 코드 참조 방식 | 소스 ProjectReference | 정확한 버전 NuGet 패키지 |
-| 한 서비스 소스 변경 시 영향받는 이미지 | 10/10(정적 추론) | 해당 서비스 1개(정적 추론) |
-| Oracle 데이터 소유 | 백엔드 | 백엔드(변경 없음) |
+| Dockerfile | 1 | 10 |
+| 다른 저장소 소스를 참조하는 ProjectReference | - | 0 |
+| 저장소 밖 소스를 포함하는 Compile | - | 0 |
+| 공통 코드 참조 | 소스 ProjectReference | 정확한 버전 NuGet 패키지 |
+| 서비스 소스 변경 시 영향받는 이미지(구조 기준) | 10 | 1 |
+| Oracle 데이터 소유 | 백엔드 | 백엔드 |
 
-> 영향받는 이미지 수는 Dockerfile 구조로 추론한 값입니다. 실제 재빌드 시간이나 캐시 적중률은 측정하지 않았습니다.
+영향받는 이미지 수는 Dockerfile 구조로 산정한 값이며, 실제 재빌드 시간이나 캐시 적중률은 측정하지 않았습니다.
 
 ## 설계
 
-### 문제
-- 루트 Dockerfile이 저장소 전체를 복사한 뒤 솔루션을 restore해서, 한 서비스만 고쳐도 10개 이미지의
-  빌드 입력이 함께 바뀌었습니다.
-- 공유 코드와 검증 도구가 다른 서비스 소스를 직접 참조해서, 서비스 하나만 따로 빌드할 수 없었습니다.
+### 분리 범위
 
-### 검토한 안과 선택
+업무 백엔드를 도메인별로 나누거나 DB를 분리하는 것은 이번 범위에서 제외했습니다. 서비스 책임과 동작은 유지하고,
+저장소·패키지·이미지의 빌드 입력을 독립시키는 데 집중했습니다.
 
-| 고민 | 비교한 안 | 선택과 이유 |
+### 공통 코드 배포
+
+| 항목 | 결정 | 이유 |
 |---|---|---|
-| 범위 | 백엔드를 업무 도메인별로 쪼개기 / **빌드 입력만 분리** | 동작을 바꾸지 않고 저장소·패키지·이미지만 나눴습니다. DB 분리는 범위 밖입니다. |
-| 공유 코드 | 소스 ProjectReference 유지 / **버전 NuGet 패키지** | 소비자가 버전을 올리기 전까지 빌드 입력이 바뀌지 않습니다. 호환성 책임이 사라진 게 아니라 업그레이드를 명시적으로 고르게 된 것입니다. |
-| 패키지 배포 | **공개 GitHub Release 자산 + SHA-256 잠금** | 서비스 CI가 다른 저장소를 읽는 토큰 없이 받을 수 있고, 해시로 같은 바이트인지 확인합니다. 같은 버전을 다른 바이트로 다시 올리지 않습니다. |
-| 버전 범위 | 범위 허용 / **정확한 버전 [x.y.z]** | 의도하지 않은 버전이 섞이지 않습니다. 중앙 패키지 관리(Directory.Packages.props)로 한 곳에서 고정합니다. |
-| 패키지 출처 | 아무 소스 / **packageSourceMapping** | `FactoryMES.*`는 로컬 고정 폴더에서만 받습니다. |
-| NuGet 캐시 | 전역 캐시 / **저장소별 캐시** | 아래 문제를 겪고 바꿨습니다. |
+| 공통 코드 | Contracts·Foundation을 버전 NuGet 패키지로 전환 | 소비 저장소가 버전을 올리기 전까지 빌드 입력이 바뀌지 않음 |
+| 배포 위치 | 공개 GitHub Release 자산 | 서비스 CI가 다른 저장소를 읽는 토큰 없이 패키지를 받을 수 있음 |
+| 무결성 | 저장소별 `build/package-lock.json`에 SHA-256 고정 | 같은 버전이 다른 바이트로 바뀌지 않았는지 복원 시 확인 |
+| 버전 범위 | 중앙 패키지 관리에서 정확한 버전 `[x.y.z]` 고정 | 의도하지 않은 버전 혼입 방지 |
+| 패키지 출처 | packageSourceMapping으로 `FactoryMES.*`는 로컬 고정 폴더에서만 | 다른 소스의 같은 이름 패키지 차단 |
+| 캐시 | 저장소별 NuGet 캐시 | 전역 캐시의 임시 패키지가 잘못된 해시를 가리는 문제 방지 |
 
-## 진행 중 겪은 문제
+공통 패키지를 바꿔도 각 서비스는 버전을 명시적으로 올릴 때만 영향을 받습니다. 호환성 관리가 없어진 것이 아니라
+업그레이드 시점을 서비스별로 선택하는 구조입니다.
+
+### 서비스 Dockerfile
+
+설정 파일, 잠금 파일, 고정 패키지만 먼저 복사해 `--locked-mode`로 복원하고, 그다음 자기 서비스 소스만 복사해
+`--no-restore`로 빌드합니다. 서비스 소스 변경은 해당 이미지에만 영향을 주고, 패키지 구성이 그대로라면 복원
+계층을 재사용할 수 있습니다.
+
+```dockerfile
+COPY global.json Directory.Build.props Directory.Packages.props NuGet.Config ./
+COPY .packages/ ./.packages/
+COPY services/mes-backend/*.csproj services/mes-backend/packages.lock.json ./services/mes-backend/
+RUN dotnet restore services/mes-backend/FactoryMES.Backend.csproj --locked-mode
+COPY services/mes-backend/ ./services/mes-backend/
+RUN dotnet publish services/mes-backend/FactoryMES.Backend.csproj -c Release --no-restore -o /out
+```
+
+## 진행 중 발생한 문제
 
 | 문제 | 원인 | 해결 |
 |---|---|---|
-| 잠금 파일 해시 22개 중 19개 불일치 | 전역 NuGet 캐시에 같은 버전의 임시 패키지가 남아 있어 잘못된 해시를 가렸습니다 | 캐시 정리, 저장소별 `globalPackagesFolder`로 변경, 고정 자산 기준으로 재생성 |
-| 배포된 자산 해시가 로컬 pack과 다름 | CI가 패키지를 다시 만들어 바이트가 달라졌습니다 | 소비 저장소를 배포된 자산 해시로 다시 고정하고 깨끗한 복사본에서 확인 |
-| Docker restore NU1004 | .razor 파일이 있을 때만 SDK가 추가하는 패키지가 잠금 파일과 어긋났습니다 | 웹 프로젝트에 `RequiresAspNetWebAssets` 명시 |
-| 백엔드 CI 실패 | 테스트 프로젝트만 옛 버전 [1.0.0]에 고정돼 있었습니다 | [1.1.0]으로 고치고 새 태그 v1.1.1 발행. **이미 배포한 v1.1.0 태그는 옮기지 않았습니다** |
+| 잠금 파일 해시 22개 중 19개 불일치 | 전역 NuGet 캐시에 남은 같은 버전의 임시 패키지가 잘못된 해시를 가림 | 캐시 정리, 저장소별 `globalPackagesFolder` 적용, 고정 자산 기준 재생성 |
+| 배포 자산 해시와 로컬 패키지 해시 불일치 | CI에서 패키지를 다시 생성해 바이트가 달라짐 | 소비 저장소를 배포 자산 해시로 재고정하고 깨끗한 환경에서 복원 확인 |
+| Docker 복원 시 NU1004 | .razor 파일이 있을 때만 SDK가 추가하는 패키지가 잠금 파일과 불일치 | 웹 프로젝트에 `RequiresAspNetWebAssets` 명시 |
+| 백엔드 CI 실패 | 테스트 프로젝트만 이전 패키지 버전에 고정 | 버전 수정 후 새 태그 v1.1.1 발행, 배포된 v1.1.0 태그는 변경하지 않음 |
 
-## 코드
+## 주요 코드
 
 <div class="screen" markdown="1">
 
-서비스 Dockerfile: 설정·잠금·고정 패키지만 먼저 복사해 `--locked-mode`로 restore하고, 그다음 자기 소스만 복사합니다.
+서비스 Dockerfile.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/Dockerfile#L1-L18">소스 보기</a>
 
@@ -91,7 +120,7 @@ flowchart TB
 
 <div class="screen" markdown="1">
 
-정확한 버전 고정(중앙 패키지 관리).
+중앙 패키지 관리의 정확한 버전 고정.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/Directory.Packages.props#L1-L21">소스 보기</a>
 
@@ -99,7 +128,7 @@ flowchart TB
 
 <div class="screen" markdown="1">
 
-`FactoryMES.*`는 로컬 고정 폴더에서만, 캐시는 저장소 안에.
+`FactoryMES.*` 패키지 출처 제한과 저장소별 캐시.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/NuGet.Config#L1-L19">소스 보기</a>
 
@@ -107,11 +136,9 @@ flowchart TB
 
 ## 검증과 한계
 
-- 저장소마다 자기 소스만 빌드하는 CI가 있습니다. 공개 직후 11개 저장소의 원격 CI가 모두 통과했고, 빈 폴더에서
-  고정 commit으로 checkout → 공개 패키지 해시 확인 → locked restore → 검증 도구 빌드까지 재현했습니다.
-- 그 뒤 알림 라우팅을 배포할 때 platform·backend·web·system CI가 다시 통과했고, backend·web 이미지가 GHCR에 게시됐습니다.
-- 운영 서버가 없어서 자동 운영 배포까지 했다고는 말하지 않습니다.
-- 통합 검증 도구는 백엔드·설비 커넥터 내부 로직을 보려고 **TestSupport 패키지**를 씁니다. 저장소 간 소스 결합은
-  없앴지만, 내부 타입에 기대는 화이트박스 검증 결합까지 없앤 것은 아닙니다.
-- Oracle 스키마는 여전히 서비스들이 공유합니다.
-- 실제 재빌드 시간·캐시 적중률은 측정하지 않았습니다.
+- 공개 직후 11개 저장소의 원격 CI 통과
+- 빈 폴더에서 고정 commit checkout → 공개 패키지 해시 확인 → locked restore → 검증 도구 빌드 재현
+- 알림 라우팅 배포 시 platform·backend·web·system CI 재통과, backend·web 이미지 GHCR 게시
+- 통합 검증 도구는 내부 로직 검증을 위해 TestSupport 패키지를 사용하므로 화이트박스 검증 결합은 유지
+- Oracle 스키마는 서비스 간 공유 상태
+- 운영 서버가 없어 자동 운영 배포는 미적용, 재빌드 시간·캐시 적중률은 미측정

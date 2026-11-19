@@ -4,11 +4,21 @@ title: 설비 연결·수집
 
 # 설비 연결·수집
 
-관리자가 화면에서 설비 연결을 등록하면, 그 설정이 Oracle → Redis → 연동 게이트웨이를 거쳐
-설비 커넥터에 반영되고, 커넥터가 수집한 값이 경보·AUTO 생산실적·통계로 이어집니다.
-설비는 로컬 시뮬레이터 두 종류(HTTP, Modbus TCP)로 대신했습니다.
+## 개요
 
-## 구성도
+관리자가 등록한 설비 연결 설정은 Oracle에 버전과 함께 저장되고, 연동 게이트웨이가 Redis에 캐시한 뒤
+설비 커넥터에 적용합니다. 커넥터는 HTTP 또는 Modbus TCP로 설비 값을 읽어 백엔드로 보내며, 백엔드는
+측정값·AUTO 생산실적·경보 판정을 한 트랜잭션으로 저장한 뒤 ACK를 반환합니다.
+
+```text
+관리자 설정 저장 → Oracle(설정 + 버전 + Outbox)
+  → 게이트웨이 설정 재조회 → Redis 적재 → 커넥터 적용 → 적용 버전 보고
+
+커넥터 수집 임대 → 설비 읽기 → 측정 배치 전송
+  → 백엔드 검증·커밋 → ACK → (ACK 없으면 같은 이벤트 재전송)
+```
+
+## 구성
 
 ```mermaid
 flowchart LR
@@ -23,7 +33,14 @@ flowchart LR
     backend -->|"원시 측정 · AUTO 원장 · 경보<br/>한 트랜잭션"| oracle
 ```
 
-## 흐름도
+| 구성 | 역할 | 맡지 않는 일 |
+|---|---|---|
+| mes-backend | 설정 원본·버전, 수집 증명 발급, 측정 검증·저장 | 실제 설비 호출, Redis 관리 |
+| integration-gateway | 설정 캐시·복구, 설정 적용 중계, 임대 요청 중계 | Oracle 직접 접근, 임의 URL 호출 |
+| equipment-connector | 주기 수집, 자료형·단위 변환, 이벤트 생성·재전송, 상태 보고 | DB·Redis 직접 접근, 실적 계산 |
+| Redis | 재생성 가능한 설정 복사본 | 설정 원본, 인증 정보 보관 |
+
+## 처리 흐름
 
 ```mermaid
 sequenceDiagram
@@ -52,25 +69,43 @@ sequenceDiagram
 
 ## 설계
 
-### 문제
-- 설비 설정을 Redis에만 두면 이력·권한·감사가 남지 않고, Oracle에만 두면 커넥터가 업무 DB에 묶입니다.
-- 설정을 바꾸거나 사용을 끈 뒤에도 커넥터가 옛 설정으로 계속 수집할 수 있습니다.
-- 네트워크가 끊기면 같은 측정을 다시 보내게 되는데, 이게 두 번 저장되면 생산 수량이 늘어납니다.
+### 설정 원본과 캐시
 
-### 검토한 안과 선택
-
-| 고민 | 비교한 안 | 선택과 이유 |
+| 항목 | 검토한 방식 | 결정 |
 |---|---|---|
-| 설정 원본 | Redis만 / **Oracle 원본 + Redis 캐시** | Oracle에 버전과 함께 저장. Redis는 지워져도 다시 만들 수 있는 복사본입니다. |
-| 사용중지 반영 | 캐시 TTL만 / **수집 임대 + 서명 증명** | 수집할 때마다 원본의 사용 여부·버전을 확인한 짧은 증명을 받습니다. 사용을 끄면 다음 임대에서 막힙니다. |
-| 실행 허가 저장 | 허가 테이블 / **서명 토큰** | 5초마다 행이 쌓이는 테이블 대신 서명 토큰으로 대체했습니다(설계 단계 결정). |
-| 중복 방지 | 시각 기준 / **이벤트 ID + (대상, 스트림, 순번)** | 재전송이면 기존 결과를 DUPLICATE로 돌려주고, 같은 순번에 다른 값이면 거절합니다. |
-| 재전송 | 새 이벤트로 다시 수집 / **원래 이벤트 그대로 재전송** | ACK를 못 받으면 같은 이벤트 ID·증명으로 다시 보내고, 허용 시간이 지나면 버립니다. |
-| 프로토콜 | OPC UA / **Modbus TCP FC03** | 필요한 값은 누적 카운터·온도였고 UA의 정보 모델·구독·인증서까지 검증할 장치가 없었습니다. 무료 .NET 구현이 있어서 비용 때문에 뺀 것은 아니고, 필요해지면 다시 검토합니다. |
+| 설정 저장 | Redis만 사용 / Oracle 원본 + Redis 캐시 | Oracle 원본. 이력·제약·권한·감사를 트랜잭션으로 함께 관리 |
+| 캐시 미스·장애 | 수집 중단 / 백엔드 내부 API 재조회 | 내부 API로 다시 읽어 캐시 재구성 |
+| 변경 반영 | TTL 만료 대기 / Outbox 기반 무효화 | 설정 저장과 Outbox를 같은 트랜잭션에 기록하고 게이트웨이가 새 버전 적재 |
+| 버전 역전 | 마지막 도착 우선 / 버전 비교 | 오래된 버전으로 캐시를 덮어쓰지 않음 |
 
-Modbus는 무료 라이브러리(NModbus)를 썼는데, 직접 만든 TCP 서버로 비정상 응답을 보내 보니
-**잘못된 MBAP 프로토콜 ID나 남는 바이트를 그대로 받아들이는 경우**가 있었습니다. 클라이언트를
-새로 만들지 않고 FC03 응답 프레임 검사만 보강했습니다.
+화면에는 설정 버전과 적용 버전을 함께 표시해, 저장된 설정이 커넥터에 실제로 적용됐는지 확인할 수 있게
+했습니다.
+
+### 사용중지 설정의 수집 차단
+
+캐시 TTL만으로는 설비 연결을 사용중지해도 일정 시간 동안 옛 설정으로 수집이 이어질 수 있습니다.
+커넥터는 수집 전에 수집 임대를 갱신하고, 백엔드는 원본의 사용 여부·설정 버전·해시를 확인한 뒤 짧은 수명의
+서명 증명을 발급합니다. 사용중지되거나 버전이 바뀌면 다음 임대에서 수집이 중단됩니다. 실행 허가를
+테이블에 저장하는 방식은 5초마다 행이 쌓이는 문제가 있어 서명 토큰으로 대체했습니다.
+
+### 중복과 재전송
+
+| 상황 | 처리 |
+|---|---|
+| ACK를 받지 못함 | 같은 이벤트 ID·같은 증명으로 재전송, 허용 시간이 지나면 폐기 |
+| 이미 저장된 같은 이벤트 | 저장하지 않고 DUPLICATE 응답 |
+| 같은 (대상, 스트림, 순번)에 다른 값 | 거절 |
+| 저장 중 오류 | 원시 측정·AUTO 원장·경보 판정 전체 롤백 |
+
+### 프로토콜 선택
+
+필요한 값은 누적 카운터와 온도였습니다. OPC UA는 정보 모델·구독·보안 구성이 장점이지만, 이를 검증할
+장치 모델이 없는 상태에서 세션·구독·인증서 운영까지 함께 다뤄야 했습니다. Modbus TCP의 FC03 읽기를 먼저
+구현하고, 설정에는 0 기준 레지스터 주소·자료형·바이트/워드 순서를 명시하도록 했습니다.
+
+무료 라이브러리 NModbus를 사용하면서 별도 TCP 서버로 비정상 응답을 보내 확인한 결과, 잘못된 MBAP
+프로토콜 ID와 응답 뒤에 남는 바이트를 그대로 받아들이는 경우가 있었습니다. 클라이언트 전체를 새로
+만들지 않고 FC03 응답 프레임 검사만 보강했습니다.
 
 ## 화면
 
@@ -80,9 +115,8 @@ Modbus는 무료 라이브러리(NModbus)를 썼는데, 직접 만든 TCP 서버
 
 ![설비 연결 목록](assets/screens/equipment-connections.png)
 
-제목 아래에 **설정이 어디를 거쳐 설비까지 가는지**(Oracle → Redis → 게이트웨이 → 커넥터 → 시뮬레이터)를
-적어 두었습니다. 목록에는 **설정 버전과 적용 버전**을 나란히 보여줍니다. 저장했다고 끝이 아니라
-커넥터가 실제로 적용했는지가 중요하기 때문입니다. 연결 상태는 3초마다 갱신할 수 있습니다.
+설정이 Oracle → Redis → 게이트웨이 → 커넥터 → 시뮬레이터로 전달되는 경로를 제목 아래에 표시하고,
+목록에는 설정 버전과 적용 버전을 나란히 보여줍니다. 연결 상태는 3초 주기로 갱신할 수 있습니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-web/blob/2d05837500b6de42f46230227fc593291856e0ff/services/web-client/Pages/EquipmentConnections.razor#L1-L103">소스 보기</a>
 
@@ -94,19 +128,19 @@ Modbus는 무료 라이브러리(NModbus)를 썼는데, 직접 만든 TCP 서버
 
 ![연결 설정 수정](assets/screens/equipment-connection-detail.png)
 
-프로토콜은 **HTTP Mock과 Modbus TCP만** 고를 수 있고, 주소는 승인된 시뮬레이터 형식만 받습니다.
-임의 URL을 넣어 내부망 밖으로 요청을 보내지 못하게 하려는 것입니다. Modbus를 고르면 레지스터 주소(0 기준),
-자료형, 바이트·워드 순서를 태그마다 지정합니다.
+프로토콜은 HTTP Mock과 Modbus TCP 중에서 선택하고, 주소는 승인된 시뮬레이터 형식만 받습니다. 임의 URL로
+내부망 밖에 요청을 보내지 못하도록 하기 위한 제한입니다. Modbus는 태그마다 레지스터 주소, 자료형,
+바이트·워드 순서를 지정합니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-web/blob/2d05837500b6de42f46230227fc593291856e0ff/services/web-client/Pages/EquipmentConnections.razor#L104-L365">소스 보기</a>
 
 </div>
 
-## 핵심 코드
+## 주요 코드
 
 <div class="screen" markdown="1">
 
-게이트웨이 설정 캐시: Redis에 없으면 백엔드 내부 API로 다시 읽어 적재하고, 오래된 버전은 덮어쓰지 않습니다.
+게이트웨이 설정 캐시: 캐시에 없으면 백엔드 내부 API로 다시 읽어 적재하고, 오래된 버전은 덮어쓰지 않습니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-integration-gateway/blob/fb8f2b008261f2a44e1d099cfbf447a82ee3472e/services/integration-gateway/ConfigurationCache.cs#L80-L221">소스 보기</a>
 
@@ -114,7 +148,7 @@ Modbus는 무료 라이브러리(NModbus)를 썼는데, 직접 만든 TCP 서버
 
 <div class="screen" markdown="1">
 
-수집 임대: 원본의 사용 여부·버전·해시를 확인하고 짧은 수집 증명을 발급합니다.
+수집 임대: 원본의 사용 여부·버전·해시를 확인하고 수집 증명을 발급합니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/services/mes-backend/Features/Collection/CollectionService.Telemetry.cs#L16-L77">소스 보기</a>
 
@@ -122,8 +156,7 @@ Modbus는 무료 라이브러리(NModbus)를 썼는데, 직접 만든 TCP 서버
 
 <div class="screen" markdown="1">
 
-측정 저장: 이미 저장된 같은 이벤트는 DUPLICATE로 응답하고, 새 이벤트는 증명과 스트림 순번을 확인한 뒤
-원시 측정·AUTO 원장·경보를 한 트랜잭션으로 커밋한 다음 ACK를 돌려줍니다.
+측정 저장: 중복 이벤트 응답, 증명·스트림 순번 검증, 측정·AUTO 원장·경보의 단일 트랜잭션 저장.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-backend/blob/35b21c06298e68430fe08a6b5c3cd4ab1a683cf6/services/mes-backend/Features/Collection/CollectionService.Telemetry.cs#L78-L307">소스 보기</a>
 
@@ -131,7 +164,7 @@ Modbus는 무료 라이브러리(NModbus)를 썼는데, 직접 만든 TCP 서버
 
 <div class="screen" markdown="1">
 
-커넥터 재전송: ACK를 못 받은 배치는 같은 이벤트로 다시 보내고, 허용 시간이 지나면 버립니다.
+커넥터 재전송: ACK를 받지 못한 배치를 같은 이벤트로 재전송하고 허용 시간이 지나면 폐기합니다.
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-equipment-connector/blob/2246447569e0cb1fdaa9debe31874afe42d06697/services/equipment-connector/EquipmentCollector.cs#L143-L304">소스 보기</a>
 
@@ -139,7 +172,7 @@ Modbus는 무료 라이브러리(NModbus)를 썼는데, 직접 만든 TCP 서버
 
 <div class="screen" markdown="1">
 
-Modbus FC03 응답 프레임 검사 보강(MBAP 프로토콜 ID, 길이, 남는 바이트).
+Modbus FC03 응답 프레임 검사(MBAP 프로토콜 ID, 길이, 잔여 바이트).
 
 <a class="source-link" href="https://github.com/nkpFactoryMES/factorymes-equipment-connector/blob/2246447569e0cb1fdaa9debe31874afe42d06697/services/equipment-connector/Protocols/StrictModbusTcpTransport.cs#L10-L86">소스 보기</a>
 
@@ -147,10 +180,10 @@ Modbus FC03 응답 프레임 검사 보강(MBAP 프로토콜 ID, 길이, 남는 
 
 ## 검증과 한계
 
-- Redis를 비우거나 멈춘 상태, 설정 변경·사용중지, 재전송, 시뮬레이터 정지·재기동을 실제 컨테이너로
-  확인했습니다. 시뮬레이터가 멈추면 새 정상 값을 만들지 않고 재시도 상태로 표시합니다.
-- Modbus 단계에서 프레임·변환, 실제 수집·장애·실적, 화면, 기존 회귀를 합쳐 422개 검사를 통과했습니다.
-- 상세: [Redis·Mock 수집 설계](https://github.com/nkpFactoryMES/factorymes-system/blob/de9e542d9e362add9f5aec3293986d4744c13b12/docs/redis-mock-collection-design.md),
+- Redis 비움·중지, 설정 변경·사용중지, 재전송, 시뮬레이터 중지·재기동을 실제 컨테이너로 확인
+- 시뮬레이터 중지 시 새 정상 값 대신 재시도 상태 표시 확인
+- Modbus 단계에서 프레임·변환, 실제 수집·장애·실적, 화면, 기존 회귀 포함 422개 검사 통과
+- 상세 문서: [Redis·Mock 수집 설계](https://github.com/nkpFactoryMES/factorymes-system/blob/de9e542d9e362add9f5aec3293986d4744c13b12/docs/redis-mock-collection-design.md),
   [설비 통신 방식 비교](https://github.com/nkpFactoryMES/factorymes-system/blob/de9e542d9e362add9f5aec3293986d4744c13b12/docs/equipment-protocol-decision.md)
-- 실제 PLC가 아니라 로컬 시뮬레이터입니다. 제조사별 호환, 고부하, TLS, OPC UA는 검증하지 않았습니다.
-- 커넥터의 재전송 버퍼는 메모리에 있어서, 프로세스가 죽으면 ACK 전 측정은 잃을 수 있습니다.
+- 실제 PLC 대신 로컬 시뮬레이터 사용, 제조사별 호환·고부하·TLS·OPC UA는 미검증
+- 커넥터 재전송 버퍼는 메모리에 있어 프로세스 종료 시 ACK 전 측정 유실 가능
